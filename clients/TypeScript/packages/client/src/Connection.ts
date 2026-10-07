@@ -173,31 +173,69 @@ export const ensureSocketIsOpen = (socket: WebSocket) => {
   }
 }
 
+/**
+ * Options for the websocket send query awaiting response.
+ */
+export type MethodOptions = {
+  /**
+   * Reject the call if no response is received within this many milliseconds. Unset by default,
+   * meaning the call waits indefinitely; only opt into this for calls that expect a prompt
+   * response (e.g. a LedgerStateQuery query), not ones that legitimately wait for a change.
+   */
+  timeout?: number
+}
+
 /** @internal */
 export const send = async <T>(
-  send: (socket: WebSocket) => Promise<T>,
-  context: InteractionContext
+  send: (socket: WebSocket, onSettle: (cleanup: () => void) => void) => Promise<T>,
+  context: InteractionContext,
+  options?: MethodOptions
 ): Promise<T> => {
   const { socket } = context
   return new Promise((resolve, reject) => {
+    let settled = false
+    let cleanup: (() => void) | undefined
+    let timer: ReturnType<typeof setTimeout> | undefined
+
+    /**
+     * Runs the full teardown and guards against running it multiple times.
+     */
+    function settleOnce (fn: () => void) {
+      if (settled) { return }
+      settled = true
+      cleanup?.()
+      if (timer !== undefined) { clearTimeout(timer) }
+      socket.removeListener('close', onUnexpectedClose)
+      fn()
+    }
+
     function onUnexpectedClose (code: CloseEvent['code'], reason: CloseEvent['reason']) {
-      reject(new JSONRPCError(
+      settleOnce(() => reject(new JSONRPCError(
         -32000,
         'Connection closed',
         { code, reason }
-      ))
+      )))
     }
 
     socket.once('close', onUnexpectedClose)
 
-    send(socket)
-      .then(resolve)
-      .catch(error => reject(JSONRPCError.tryFrom(error) || error))
-      .finally(() => socket.removeListener('close', onUnexpectedClose))
+    if (options?.timeout !== undefined) {
+      timer = setTimeout(() => {
+        settleOnce(() => reject(new Error(`Request timed out after ${options.timeout}ms`)))
+      }, options.timeout)
+    }
+
+    send(socket, fn => { cleanup = fn })
+      .then(result => settleOnce(() => resolve(result)))
+      .catch(error => settleOnce(() => reject(JSONRPCError.tryFrom(error) || error)))
   })
 }
 
-/** @internal */
+/**
+ * Fire a request and resolve once it's answered (response, failure, timeout, etc.).
+ *
+ * @internal
+ */
 export const Method = <
   Request extends { method: string, params?: any },
   Response extends { method: string, id?: { requestId?: string } },
@@ -210,20 +248,20 @@ export const Method = <
     res: {
       handler?: (
         response: Response,
-        resolve: (value?: A | PromiseLike<A>) => void,
+        resolve: (value: A | PromiseLike<A>) => void,
         reject: (reason?: any) => void
       ) => void
     },
-    context: InteractionContext
+    context: InteractionContext,
+    options?: MethodOptions
   ): Promise<A> =>
-    send<A>((socket) =>
+    send<A>((socket, onSettle) =>
       new Promise((resolve, reject) => {
         const requestId = nanoid(16)
 
         async function listener (data: string) {
           const response = safeJSON.parse(data) as Response
           if (response?.id?.requestId !== requestId) { return }
-          socket.removeListener('message', listener)
           try {
             const handler = res.handler || ((response, resolve, reject) => {
               if (response.method === req.method && response) {
@@ -243,9 +281,10 @@ export const Method = <
           }
         }
 
-        socket.on('message', listener)
-
         ensureSocketIsOpen(socket)
+
+        socket.on('message', listener)
+        onSettle(() => socket.removeListener('message', listener))
 
         socket.send(safeJSON.stringify({
           ...baseRequest,
@@ -253,4 +292,4 @@ export const Method = <
           params: req.params,
           id: { requestId }
         } as unknown as Request))
-      }), context)
+      }), context, options)
