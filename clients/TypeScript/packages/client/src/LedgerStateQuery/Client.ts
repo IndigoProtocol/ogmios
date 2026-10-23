@@ -80,7 +80,8 @@ export interface LedgerStateQueryClient {
 
 /**
  * Initialize a {@link LedgerStateQueryClient} from an {@link InteractionContext}. `methodOptions`,
- * when set, applies to every call made through the returned client.
+ * when set, applies to every call made through the returned client, including
+ * `acquireLedgerState` and `releaseLedgerState`.
  *
  * @category Constructor
  */

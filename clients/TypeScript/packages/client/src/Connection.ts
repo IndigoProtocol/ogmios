@@ -1,4 +1,5 @@
 import { nanoid } from 'nanoid'
+import { CustomError } from 'ts-custom-error'
 import { WebSocket, CloseEvent } from './IsomorphicWebSocket'
 import { getServerHealth, ServerNotReady } from './ServerHealth'
 import { safeJSON } from './util'
@@ -96,6 +97,20 @@ export class JSONRPCError extends Error {
   }
 }
 
+/**
+ * Raised when a request made with a {@link MethodOptions} `timeout` receives no response in time.
+ *
+ * @category Connection
+ */
+export class RequestTimeoutError extends CustomError {
+  public readonly timeout: number
+
+  public constructor (timeout: number) {
+    super(`Request timed out after ${timeout}ms`)
+    this.timeout = timeout
+  }
+}
+
 /** @category Constructor */
 export function createConnectionObject (config?: ConnectionConfig): Connection {
   if (config?.address && (config?.host || config?.port || config?.tls)) {
@@ -175,12 +190,15 @@ export const ensureSocketIsOpen = (socket: WebSocket) => {
 
 /**
  * Options for the websocket send query awaiting response.
+ *
+ * @category Connection
  */
 export type MethodOptions = {
   /**
-   * Reject the call if no response is received within this many milliseconds. Unset by default,
-   * meaning the call waits indefinitely; only opt into this for calls that expect a prompt
-   * response (e.g. a LedgerStateQuery query), not ones that legitimately wait for a change.
+   * Reject the call with a {@link RequestTimeoutError} if no response is received within this
+   * many milliseconds. Unset by default (the call waits indefinitely). The server still
+   * processes a timed-out request, so discard the connection afterwards; see "Request
+   * Timeouts" in the README.
    */
   timeout?: number
 }
@@ -221,7 +239,7 @@ export const send = async <T>(
 
     if (options?.timeout !== undefined) {
       timer = setTimeout(() => {
-        settleOnce(() => reject(new Error(`Request timed out after ${options.timeout}ms`)))
+        settleOnce(() => reject(new RequestTimeoutError(options.timeout)))
       }, options.timeout)
     }
 
