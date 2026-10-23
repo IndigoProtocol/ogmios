@@ -142,6 +142,52 @@ export function createConnectionObject (config?: ConnectionConfig): Connection {
   }
 }
 
+/** @internal */
+const DEFAULT_HEARTBEAT_INTERVAL = 30_000
+
+/**
+ * Starts a `ws`-level ping/pong heartbeat on an open socket: after `interval` ms of silence,
+ * pings and waits for a reply; if none arrives (no pong, no other message) before the next tick,
+ * terminates the connection (which fires `close`, letting the rest of the stack handle it as any
+ * other disconnect). Any inbound traffic — a pong, or an ordinary message — counts as proof of
+ * life and pushes the next check back by a full `interval`, so an actively-used connection never
+ * gets pinged at all.
+ *
+ * @internal
+ */
+const startHeartbeat = (socket: WebSocket, interval: number) => {
+  if (!interval || interval <= 0) { return }
+  // A no-op when the socket doesn't support `ping` (e.g. a browser WebSocket, which exposes no such API)
+  if (typeof socket.ping !== 'function') { return }
+
+  let timer: ReturnType<typeof setTimeout>
+
+  // Quiet for `interval` -> send a ping, then wait `interval` for any sign of life
+  const probe = () => {
+    if (socket.readyState !== socket.OPEN) { return }
+    try { socket.ping() } catch { return socket.terminate() }
+    timer = setTimeout(() => socket.terminate(), interval)
+    timer.unref?.()
+  }
+
+  // Any activity: cancel whatever is pending and restart the idle countdown
+  const onAlive = () => {
+    clearTimeout(timer)
+    timer = setTimeout(probe, interval)
+    timer.unref?.()
+  }
+
+  socket.on('pong', onAlive)
+  socket.on('message', onAlive)
+  onAlive()
+
+  socket.once('close', () => {
+    clearTimeout(timer)
+    socket.removeListener('pong', onAlive)
+    socket.removeListener('message', onAlive)
+  })
+}
+
 /** @category Constructor */
 export const createInteractionContext = async (
   errorHandler: WebSocketErrorHandler,
@@ -149,7 +195,15 @@ export const createInteractionContext = async (
   options?: {
     connection?: ConnectionConfig
     maxEventListeners?: number,
+    /**
+     * Ping interval, in milliseconds, used to detect a half-open connection (NAT timeout,
+     * laptop sleep, dropped network) that would otherwise hang requests silently. Defaults to
+     * 30s; pass `0` (or any non-positive value) to disable. Node-only: a no-op in environments
+     * without access to WebSocket ping/pong frames (e.g. browsers).
+     */
+    heartbeat?: number
   }): Promise<InteractionContext> => {
+  const { heartbeat = DEFAULT_HEARTBEAT_INTERVAL } = options ?? {}
   const connection = createConnectionObject(options?.connection)
   const health = await getServerHealth({ connection })
   return new Promise((resolve, reject) => {
@@ -162,16 +216,21 @@ export const createInteractionContext = async (
       socket.removeAllListeners()
       return reject(error)
     }
-    socket.setMaxListeners(options.maxEventListeners || 10)
-    socket.on('error', onInitialError)
-    socket.once('close', (_code: number, reason: string) => {
+    const onInitialClose = (_code: number, reason: string) => {
       socket.removeAllListeners()
       reject(new Error(reason))
-    })
+    }
+    socket.setMaxListeners(options?.maxEventListeners ?? 10)
+    socket.on('error', onInitialError)
+    socket.once('close', onInitialClose)
     socket.on('open', async () => {
       socket.removeListener('error', onInitialError)
+      socket.removeListener('close', onInitialClose)
       socket.on('error', errorHandler)
       socket.on('close', closeHandler)
+
+      startHeartbeat(socket, heartbeat)
+
       resolve({
         connection,
         socket
