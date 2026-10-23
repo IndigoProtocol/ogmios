@@ -6,16 +6,18 @@ import {
   createInteractionContext,
   createConnectionObject,
   InteractionContext,
+  JSONRPCError,
   RequestTimeoutError,
   LedgerStateQuery
 } from '../src'
 
 /**
  * A server that reports itself healthy and accepts WebSocket connections, but never sends
- * anything on them afterwards. Mimics a server that is stuck, or a connection that has silently
- * gone half-open.
+ * anything on them afterwards: no response to requests and no pong to pings. Mimics a server
+ * that is stuck, or a connection that has silently gone half-open.
  */
-const createSilentServer = (): Promise<{ close: () => Promise<void>, port: number }> => {
+const createSilentServer = (): Promise<{ close: () => Promise<void>, port: number, pings: () => number }> => {
+  let pings = 0
   const sockets = new Set<Duplex>()
   const server = createServer((_req, res) => {
     res.setHeader('Content-Type', 'application/json')
@@ -34,6 +36,9 @@ const createSilentServer = (): Promise<{ close: () => Promise<void>, port: numbe
       `Sec-WebSocket-Accept: ${accept}`,
       '', ''
     ].join('\r\n'))
+    socket.on('data', (frame: Buffer) => {
+      if ((frame[0] & 0x0f) === 0x09) { pings += 1 }
+    })
     socket.on('error', () => {})
   })
   const close = () => new Promise<void>(resolve => {
@@ -41,7 +46,7 @@ const createSilentServer = (): Promise<{ close: () => Promise<void>, port: numbe
     server.close(() => resolve())
   })
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => {
-    resolve({ close, port: (server.address() as AddressInfo).port })
+    resolve({ close, port: (server.address() as AddressInfo).port, pings: () => pings })
   }))
 }
 
@@ -252,6 +257,37 @@ describe('Connection', () => {
         expect(error.timeout).toBe(100)
         expect(error.message).toBe('Request timed out after 100ms')
       }
+    })
+  })
+  describe('heartbeat', () => {
+    let server: { close: () => Promise<void>, port: number, pings: () => number }
+    beforeEach(async () => {
+      server = await createSilentServer()
+    })
+    afterEach(async () => {
+      await server.close()
+    })
+
+    it('rejects pending requests with "Connection closed" once a dead connection is detected', async () => {
+      expect.assertions(6)
+      let onClose: (code: number) => void
+      const closed = new Promise<number>(resolve => { onClose = resolve })
+      const context = await createInteractionContext(
+        console.error,
+        code => onClose(code),
+        { connection: { port: server.port }, heartbeat: 50 }
+      )
+      try {
+        await LedgerStateQuery.ledgerTip(context)
+      } catch (error) {
+        expect(error).toBeInstanceOf(JSONRPCError)
+        expect(error.code).toBe(-32000)
+        expect(error.message).toBe('Connection closed')
+      }
+      // Abnormal closure: the socket was terminated locally, not closed by the server.
+      expect(await closed).toBe(1006)
+      expect(context.socket.readyState).toBe(context.socket.CLOSED)
+      expect(server.pings()).toBeGreaterThanOrEqual(1)
     })
   })
 })
