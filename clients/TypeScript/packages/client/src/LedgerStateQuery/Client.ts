@@ -80,7 +80,14 @@ export interface LedgerStateQueryClient {
 
 /**
  * Initialize a {@link LedgerStateQueryClient} from an {@link InteractionContext}. `methodOptions`,
- * when set, applies to every call made through the returned client.
+ * when set, applies to every call made through the returned client, including
+ * `acquireLedgerState` and `releaseLedgerState`.
+ *
+ * Note that a `timeout` only stops the client from waiting; the server still processes the
+ * request. Since requests on a connection are processed sequentially, a timed-out
+ * `acquireLedgerState` or `releaseLedgerState` can leave the server with an acquired (or
+ * released) state that the client is unaware of. After any {@link RequestTimeoutError}, discard
+ * the connection and create a new client from a fresh {@link InteractionContext}.
  *
  * @category Constructor
  */

@@ -1,4 +1,5 @@
 import { nanoid } from 'nanoid'
+import { CustomError } from 'ts-custom-error'
 import { WebSocket, CloseEvent } from './IsomorphicWebSocket'
 import { getServerHealth, ServerNotReady } from './ServerHealth'
 import { safeJSON } from './util'
@@ -96,6 +97,24 @@ export class JSONRPCError extends Error {
   }
 }
 
+/**
+ * Raised when a request made with a {@link MethodOptions} `timeout` receives no response in time.
+ * Can be matched with `instanceof` to tell a timeout apart from other failures.
+ *
+ * After a timeout, the connection should be discarded and a new one opened. See
+ * {@link MethodOptions} for details.
+ *
+ * @category Connection
+ */
+export class RequestTimeoutError extends CustomError {
+  public readonly timeout: number
+
+  public constructor (timeout: number) {
+    super(`Request timed out after ${timeout}ms`)
+    this.timeout = timeout
+  }
+}
+
 /** @category Constructor */
 export function createConnectionObject (config?: ConnectionConfig): Connection {
   if (config?.address && (config?.host || config?.port || config?.tls)) {
@@ -175,12 +194,24 @@ export const ensureSocketIsOpen = (socket: WebSocket) => {
 
 /**
  * Options for the websocket send query awaiting response.
+ *
+ * @category Connection
  */
 export type MethodOptions = {
   /**
-   * Reject the call if no response is received within this many milliseconds. Unset by default,
-   * meaning the call waits indefinitely; only opt into this for calls that expect a prompt
-   * response (e.g. a LedgerStateQuery query), not ones that legitimately wait for a change.
+   * Reject the call with a {@link RequestTimeoutError} if no response is received within this
+   * many milliseconds. Unset by default, meaning the call waits indefinitely; only opt into this
+   * for calls that expect a prompt response (e.g. a LedgerStateQuery query), not ones that
+   * legitimately wait for a change.
+   *
+   * A timeout only gives up waiting on the client side: the server still processes the request
+   * and eventually sends a response, which is then discarded. Requests on a single connection
+   * are processed sequentially by the server, so a connection on which a request timed out is
+   * no longer in a known state. In particular, a timed-out `acquireLedgerState` (or
+   * `releaseLedgerState`) can leave the server holding an acquired (or released) ledger state
+   * that the client believes it does not have, and a timed-out query delays every request
+   * queued behind it. After a timeout, do not reuse the connection: close it and open a new
+   * {@link InteractionContext}.
    */
   timeout?: number
 }
@@ -221,7 +252,7 @@ export const send = async <T>(
 
     if (options?.timeout !== undefined) {
       timer = setTimeout(() => {
-        settleOnce(() => reject(new Error(`Request timed out after ${options.timeout}ms`)))
+        settleOnce(() => reject(new RequestTimeoutError(options.timeout)))
       }, options.timeout)
     }
 
